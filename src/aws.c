@@ -32,6 +32,8 @@ static int epollfd;
 static io_context_t ctx;
 
 
+
+
 static int aws_on_path_cb(http_parser *p, const char *buf, size_t len)
 {
 	struct connection *conn = (struct connection *)p->data;
@@ -90,17 +92,27 @@ struct connection *connection_create(int sockfd)
 	return conn;
 }
 
+size_t min(size_t a, size_t b){
+	if (a < b)
+		return a;
+	else
+		return b;
+}
+
 void connection_start_async_io(struct connection *conn)
 {
-	/* TODO: Start asynchronous operation (read from file).
-	 * Use io_submit(2) & friends for reading data asynchronously.
-	 */
+	 io_prep_pread(&conn->iocb, conn->fd, conn->send_buffer, min(conn->file_size - conn->file_pos, BUFSIZ), conn->file_pos);
+	 io_set_eventfd(&conn->iocb, conn->eventfd);
+	 w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
+	 int rc = io_submit(conn->ctx, 1, conn->piocb);
+	 DIE(rc < 0, "io_submit");
 }
 
 void connection_remove(struct connection *conn)
 {
 	close(conn->sockfd);
 	close(conn->fd);
+	close(conn->eventfd);
 	conn->state = STATE_CONNECTION_CLOSED;
 }
 
@@ -117,16 +129,23 @@ void handle_new_connection(void)
 	inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
 	int flags = fcntl(sockfd, F_GETFL, 0);
-	dlog(flags == -1, "Error getting socket flags");
+	dlog((flags == -1), "Error getting socket flags");
 
 	rc = fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-	dlog(rc == -1, "Error setting socket non-blocking");
+	dlog((rc == -1), "Error setting socket non-blocking");
 
 	conn = connection_create(sockfd);
 	conn->state = STATE_INITIAL;
 
 	rc = w_epoll_add_ptr_in(epollfd, sockfd, conn);
 	DIE(rc < 0, "w_epoll_add_in");
+
+	conn->ctx = ctx;
+	conn->piocb[0] = &conn->iocb;
+    conn->eventfd = eventfd(0, EFD_NONBLOCK);
+    DIE(conn->eventfd < 0, "eventfd");
+    rc = w_epoll_add_ptr_in(epollfd, conn->eventfd, conn);
+    DIE(rc < 0, "w_epoll_add_ptr_in");
 
 	http_parser_init(&conn->request_parser, HTTP_REQUEST);
 	conn->request_parser.data = conn;
@@ -190,12 +209,6 @@ int connection_open_file(struct connection *conn)
 	return fd;
 }
 
-void connection_complete_async_io(struct connection *conn)
-{
-	/* TODO: Complete asynchronous operation; operation returns successfully.
-	 * Prepare socket for sending.
-	 */
-}
 
 int parse_header(struct connection *conn)
 {
@@ -222,7 +235,7 @@ int parse_header(struct connection *conn)
 enum connection_state connection_send_static(struct connection *conn)
 {
 
-	ssize_t bytes = sendfile(conn->sockfd, conn->fd, &conn->file_pos, conn->file_size - conn->file_pos);
+	ssize_t bytes = sendfile(conn->sockfd, conn->fd, (off_t *)&conn->file_pos, conn->file_size - conn->file_pos);
 	if (bytes < 0)
 		return conn->state;
 	if (conn->file_pos == conn->file_size)
@@ -240,7 +253,7 @@ int connection_send_data(struct connection *conn)
 	if (rc < 0) {
 		ERR("get_peer_address");
 		connection_remove(conn);
-		return;
+		return STATE_CONNECTION_CLOSED;
 	}
 	bytes_sent = send(conn->sockfd, conn->send_buffer + conn->send_pos, conn->send_len - conn->send_pos, 0);
 
@@ -251,12 +264,12 @@ int connection_send_data(struct connection *conn)
 			return STATE_SENDING_DATA;
 		dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
 		connection_remove(conn);
-		return;
+		return STATE_CONNECTION_CLOSED;
 	}
 	if (bytes_sent == 0) {		/* connection closed */
 		dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
 		connection_remove(conn);
-		return;
+		return STATE_CONNECTION_CLOSED;
 	}
 
 	dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
@@ -269,18 +282,25 @@ int connection_send_data(struct connection *conn)
 
 int connection_send_dynamic(struct connection *conn)
 {
-	/* TODO: Read data asynchronously.
-	 * Returns 0 on success and -1 on error.
-	 */
-	return 0;
+	connection_send_data(conn);
+	if (conn->send_pos == conn->send_len) {
+		if (conn->file_pos == conn->file_size) {
+			conn->state = STATE_DATA_SENT;
+			connection_remove(conn);
+		} 
+		else {
+			connection_start_async_io(conn);
+			conn->state = STATE_ASYNC_ONGOING;
+		}
+		return 0;
+	} 
+	else  
+		return -1;
 }
 
 
 void handle_input(struct connection *conn)
 {
-	/* TODO: Handle input information: may be a new message or notification of
-	 * completion of an asynchronous I/O operation.
-	 */
 	int rc;
 	switch (conn->state) {
 	default:
@@ -293,16 +313,25 @@ void handle_input(struct connection *conn)
 					rc = w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
 					DIE(rc < 0, "w_epoll_add_ptr_inout");
 				}
-			}
+		}
+		if (conn->state == STATE_ASYNC_ONGOING){
+			uint64_t val;
+			rc = read(conn->eventfd, &val, sizeof(val));
+			DIE(rc < 0, "read eventfd");
+			struct io_event events[1]; 
+			rc = io_getevents(conn->ctx, 1, 1, events ,NULL);
+			DIE(rc < 0, "io_getevents");
+            conn->send_len = events[0].res; 
+            conn->send_pos = 0;
+            conn->file_pos += events[0].res; 
+			w_epoll_update_ptr_inout(epollfd, conn->sockfd, conn);
+			connection_send_dynamic(conn);
+		}
 	}
 }
 
 void handle_output(struct connection *conn)
 {
-	/* TODO: Handle output information: may be a new valid requests or notification of
-	 * completion of an asynchronous I/O operation or invalid requests.
-	 */
-
 	switch (conn->state) {
 		default:
 			int rc = conn->fd;
@@ -313,7 +342,7 @@ void handle_output(struct connection *conn)
 					connection_prepare_send_404(conn);
 					conn->state = STATE_SENDING_404;
 				}
-				else if (rc >= 0 && connection_get_resource_type(conn) == RESOURCE_TYPE_STATIC){
+				else if (rc >= 0){
 					connection_prepare_send_reply_header(conn);
 					conn->state = STATE_SENDING_HEADER;
 				}
@@ -335,10 +364,22 @@ void handle_output(struct connection *conn)
 				else  
 					return;
 			}
-			if (rc >= 0 && connection_get_resource_type(conn) == RESOURCE_TYPE_STATIC){
+			if (rc >= 0 && conn->state == STATE_HEADER_SENT && connection_get_resource_type(conn) == RESOURCE_TYPE_STATIC){
 				connection_send_static(conn);
 				if (conn->state == STATE_DATA_SENT) {
 					connection_remove(conn);
+				}
+			}
+			else if (rc >= 0 && conn->state == STATE_HEADER_SENT && connection_get_resource_type(conn) == RESOURCE_TYPE_DYNAMIC){
+				connection_start_async_io(conn);
+				conn->state = STATE_ASYNC_ONGOING; 
+				if (conn->state == STATE_DATA_SENT) {
+					connection_remove(conn);
+				}
+			}
+			else if (conn->state == STATE_ASYNC_ONGOING) {
+				if (conn->send_pos < conn->send_len) {
+					connection_send_dynamic(conn);
 				}
 			}
 	}
@@ -397,7 +438,14 @@ int main(void)
 			handle_client(rev.events, rev.data.ptr);
 		}
 	}
+//  read() (pe eventfd)
+// io_getevents() => struct io_event
 
+// io_prep_pread și io_set_eventfd
+//  io_submit
+//  epoll_wait
+//  io_getevents 
+// send
 
 	return 0;
 }
